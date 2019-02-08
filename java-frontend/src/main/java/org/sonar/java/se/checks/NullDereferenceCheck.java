@@ -21,10 +21,20 @@ package org.sonar.java.se.checks;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
-
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
+import javax.annotation.Nullable;
 import org.sonar.check.Rule;
 import org.sonar.java.cfg.CFG;
 import org.sonar.java.matcher.MethodMatcher;
+import org.sonar.java.matcher.MethodMatcherCollection;
+import org.sonar.java.matcher.TypeCriteria;
+import org.sonar.java.model.ExpressionUtils;
 import org.sonar.java.se.CheckerContext;
 import org.sonar.java.se.ExplodedGraph;
 import org.sonar.java.se.Flow;
@@ -43,16 +53,6 @@ import org.sonar.plugins.java.api.tree.MethodInvocationTree;
 import org.sonar.plugins.java.api.tree.MethodTree;
 import org.sonar.plugins.java.api.tree.Tree;
 
-import javax.annotation.Nullable;
-
-import java.util.ArrayDeque;
-import java.util.ArrayList;
-import java.util.Deque;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
-import java.util.stream.Collectors;
-
 @Rule(key = "S2259")
 public class NullDereferenceCheck extends SECheck {
 
@@ -62,6 +62,15 @@ public class NullDereferenceCheck extends SECheck {
   private static final String JAVA_LANG_NPE = "java.lang.NullPointerException";
   private static final MethodMatcher OPTIONAL_OR_ELSE_GET_MATCHER = MethodMatcher.create().typeDefinition("java.util.Optional").name("orElseGet")
     .addParameter("java.util.function.Supplier");
+
+  private static final String IS_NOT_NULL = "isNotNull";
+  private static final MethodMatcherCollection ASSERT_IS_NOT_NULL = MethodMatcherCollection.create(
+    MethodMatcher.create().typeDefinition(TypeCriteria.subtypeOf("org.assertj.core.api.AbstractAssert")).name(IS_NOT_NULL).withoutParameter(),
+    MethodMatcher.create().typeDefinition(TypeCriteria.subtypeOf("org.fest.assertions.GenericAssert")).name(IS_NOT_NULL).withoutParameter());
+
+  private static final MethodMatcherCollection ASSERT_THAT = MethodMatcherCollection.create(
+    MethodMatcher.create().typeDefinition(TypeCriteria.subtypeOf("org.assertj.core.api.Assertions")).name("assertThat").addParameter(TypeCriteria.anyType()),
+    MethodMatcher.create().typeDefinition(TypeCriteria.subtypeOf("org.fest.assertions.Assertions")).name("assertThat").addParameter(TypeCriteria.anyType()));
 
   private static class NullDereferenceIssue {
     final ExplodedGraph.Node node;
@@ -100,6 +109,12 @@ public class NullDereferenceCheck extends SECheck {
             return ps;
           }
         }
+        if (isIsNotNullMethod(methodInvocation)) {
+          ps = checkAssertIsNotNull(ps, context, methodInvocation);
+          if (ps == null) {
+            return ps;
+          }
+        }
         if (methodSelect.is(Tree.Kind.MEMBER_SELECT)) {
           SymbolicValue dereferencedSV = context.getState().peekValue(methodInvocation.arguments().size());
           return checkConstraint(ps, context, methodSelect, dereferencedSV);
@@ -117,6 +132,56 @@ public class NullDereferenceCheck extends SECheck {
         // ignore
     }
     return context.getState();
+  }
+
+  private static boolean isIsNotNullMethod(MethodInvocationTree methodInvocation) {
+    return ASSERT_IS_NOT_NULL.anyMatch(methodInvocation)
+      // if semantic can not resolve the method, due to type inference
+      || (methodInvocation.symbol().isUnknown() && IS_NOT_NULL.equals(ExpressionUtils.methodName(methodInvocation).name()));
+  }
+
+  private static ProgramState checkAssertIsNotNull(ProgramState currentState, CheckerContext context, MethodInvocationTree methodInvocation) {
+    // search for the parent 'assertThat' method relying on syntax
+    MethodInvocationTree mit = methodInvocation;
+    while (true) {
+      ExpressionTree methodSelect = mit.methodSelect();
+      if (!methodSelect.is(Tree.Kind.MEMBER_SELECT)) {
+        return currentState;
+      }
+      ExpressionTree expression = ((MemberSelectExpressionTree) methodSelect).expression();
+      if (!expression.is(Tree.Kind.METHOD_INVOCATION)) {
+        return currentState;
+      }
+      mit = (MethodInvocationTree) expression;
+      if (ASSERT_THAT.anyMatch(mit)) {
+        break;
+      }
+    }
+    // Retrieved the MethodInvocationTree corresponding to the 'assertThat()' coupled with 'isNotNull()'.
+    // Now searching for corresponding Node in Exploded Graph
+    ExplodedGraph.Node node = context.getNode();
+    Tree previousSyntaxNode;
+    do {
+      node = node.parent();
+      if (node == null) {
+        // reached starting point of EG and failed to find corresponding method invocation.
+        // should not happen by construction, but defensive approach
+        return currentState;
+      }
+      previousSyntaxNode = node.programPoint.syntaxTree();
+    } while (!previousSyntaxNode.equals(mit));
+
+    // check constraint on argument
+    SymbolicValue assertThatParameter = node.programState.peekValue();
+    if (assertThatParameter == null) {
+      return currentState;
+    }
+    ObjectConstraint nullNessConstraint = currentState.getConstraint(assertThatParameter, ObjectConstraint.class);
+    if (nullNessConstraint == ObjectConstraint.NULL) {
+      // kill the branch - isNotNull is interrupt the process and is going to fail the unit test
+      return null;
+    }
+    return currentState;
   }
 
   private ProgramState checkMemberSelect(CheckerContext context, MemberSelectExpressionTree mse, SymbolicValue currentVal) {
